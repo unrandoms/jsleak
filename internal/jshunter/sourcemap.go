@@ -152,6 +152,89 @@ func fetchSourceMapPayload(client *http.Client, baseURL, ref string, config *Con
 	return io.ReadAll(io.LimitReader(resp.Body, limit))
 }
 
+// FetchSourceMapByURL probes jsURL+".map" directly, independent of any
+// sourceMappingURL marker embedded in the JS body. Many production bundles
+// serve a co-located map file without the comment (Vite --no-sourcemap-comment,
+// some CDN pipelines). If the response is valid JSON with a non-empty
+// sourcesContent array, every entry is scanned through the full detection
+// pipeline. Findings are tagged with source = "sourcemap:<originFile>" so
+// operators can distinguish them from hits in the minified bundle.
+//
+// Silently returns (0, nil) when the .map URL returns a non-2xx status or
+// invalid JSON — the probe is best-effort and must not break the main scan.
+func FetchSourceMapByURL(client *http.Client, jsURL string, config *Config) (int, error) {
+	if !strings.HasPrefix(jsURL, "http://") && !strings.HasPrefix(jsURL, "https://") {
+		return 0, nil
+	}
+	mapURL := jsURL + ".map"
+	if err := validateTargetURL(mapURL, config.AllowInternal); err != nil {
+		return 0, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", mapURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	if config.UserAgent != "" {
+		req.Header.Set("User-Agent", config.UserAgent)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Non-2xx: map file absent, not an error worth surfacing.
+		return 0, nil
+	}
+
+	limit := config.MaxBytes
+	if limit <= 0 {
+		limit = DefaultMaxBytes
+	}
+	mapBytes, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return 0, err
+	}
+
+	var sm sourceMap
+	if err := json.Unmarshal(mapBytes, &sm); err != nil {
+		// Not a valid JSON sourcemap — skip silently.
+		return 0, nil
+	}
+	if len(sm.SourcesContent) == 0 {
+		return 0, nil
+	}
+
+	scanned := 0
+	for i, content := range sm.SourcesContent {
+		if content == "" {
+			continue
+		}
+		originFile := ""
+		if i < len(sm.Sources) && sm.Sources[i] != "" {
+			originFile = sm.Sources[i]
+			if sm.SourceRoot != "" && !strings.HasPrefix(originFile, "/") &&
+				!strings.Contains(originFile, "://") {
+				originFile = strings.TrimRight(sm.SourceRoot, "/") + "/" + originFile
+			}
+		}
+		src := "sourcemap:" + originFile
+		if originFile == "" {
+			src = fmt.Sprintf("sourcemap:%s#sources[%d]", jsURL, i)
+		}
+		if globalStats != nil {
+			statAdd(&globalStats.BytesParsed, int64(len(content)))
+		}
+		processed := processJSAnalysis([]byte(content), config)
+		reportMatchesWithConfig(src, processed, config)
+		scanned++
+	}
+	return scanned, nil
+}
+
 // decodeDataURI handles both base64 and percent-encoded data: URIs.
 // data:[<mediatype>][;base64],<data>
 func decodeDataURI(uri string) ([]byte, error) {
