@@ -370,6 +370,12 @@ type Config struct {
     CSPOrigins     bool
     VerifyWorkers  int
     Cache          *DiskCache
+
+    // jsleak extensions.
+    // ApkDir is a path to a jadx/apktool extraction directory. When set,
+    // all *.js files and assets/index.android.bundle inside the directory
+    // tree are scanned for secrets without any HTTP fetch.
+    ApkDir string
 }
 
 func Run() {
@@ -533,6 +539,10 @@ func Run() {
     flag.BoolVar(&cspOrigins, "csp-origins", false, "Extract Content-Security-Policy origins as candidate endpoints")
     flag.IntVar(&verifyWorkers, "verify-workers", 8, "Worker pool size for concurrent --verify probes")
 
+    // jsleak extensions
+    var apkDir string
+    flag.StringVar(&apkDir, "apk-dir", "", "Path to jadx/apktool extraction directory; scan all *.js and React Native bundle files")
+
     flag.Parse()
 
     // Apply rule-registry selection BEFORE any subcommand that depends on
@@ -648,6 +658,7 @@ func Run() {
         CacheDir: cacheDir, Robots: robotsMode,
         InlineHTML: inlineHTML, CSPOrigins: cspOrigins,
         VerifyWorkers: verifyWorkers,
+        ApkDir: apkDir,
     }
 
     // Initialize the run-wide stats struct lazily; counters are no-op when
@@ -723,6 +734,20 @@ func Run() {
             fmt.Fprintf(os.Stderr, "[%sINFO%s] HAR scan complete: %d JS entries\n",
                 colors["CYAN"], colors["NC"], n)
         }
+        emitFinalOutput(&config)
+        return
+    }
+
+    // --apk-dir: scan an APK extraction directory for JS secrets without HTTP.
+    // Mutually exclusive with URL/list/file fetch paths; handled before stdin
+    // so `echo "" | jshunter --apk-dir …` doesn't trigger the stdin branch.
+    if config.ApkDir != "" {
+        if !config.Quiet {
+            time.Sleep(100 * time.Millisecond)
+            displayAsciiArt()
+        }
+        initStats()
+        processApkDir(config.ApkDir, &config)
         emitFinalOutput(&config)
         return
     }
@@ -1185,6 +1210,7 @@ func customHelp() {
     fmt.Println("  -l,  --list FILE.txt          Input a file with URLs (.txt)")
     fmt.Println("  -f,  --file FILE.js           Path to JavaScript file")
     fmt.Println("       --har FILE               Ingest a Chrome DevTools HAR archive")
+    fmt.Println("       --apk-dir DIR            Scan jadx/apktool output directory (*.js + RN bundle)")
     fmt.Println()
     fmt.Println("Basic Options:")
     fmt.Println("  -t,  --threads INT            Number of concurrent threads (default: 5)")
@@ -2772,15 +2798,26 @@ func searchForSensitiveDataWithConfig(urlStr string, config *Config) (string, ma
             processedBody := processJSAnalysis(body, config)
             sensitiveData = reportMatchesWithConfig(urlStr, processedBody, config)
 
-            // Source-map ingestion — fetch <body>.map (or decode inline data
-            // URI), scan every entry in sourcesContent[]. Gated by --sourcemap.
+            // Source-map ingestion — two complementary strategies gated by
+            // --sourcemap:
+            //   1. Marker-based: parse //# sourceMappingURL= from the body.
+            //   2. URL-append: probe jsURL+".map" regardless of marker.
+            // Strategy 2 catches bundles that omit the comment (CDN pipelines,
+            // Vite --no-sourcemap-comment) but still serve a co-located map.
             if config.SourceMap {
                 n, err := FetchAndScanSourceMap(client, urlStr, body, config)
                 if err != nil && config.Verbose {
                     fmt.Printf("[%sSOURCEMAP%s] %s: %v\n", colors["YELLOW"], colors["NC"], urlStr, err)
                 } else if n > 0 && config.Verbose {
-                    fmt.Printf("[%sSOURCEMAP%s] %s: scanned %d original sources\n",
+                    fmt.Printf("[%sSOURCEMAP%s] %s: scanned %d original sources (marker)\n",
                         colors["CYAN"], colors["NC"], urlStr, n)
+                }
+                n2, err2 := FetchSourceMapByURL(client, urlStr, config)
+                if err2 != nil && config.Verbose {
+                    fmt.Printf("[%sSOURCEMAP%s] %s: url+.map probe: %v\n", colors["YELLOW"], colors["NC"], urlStr, err2)
+                } else if n2 > 0 && config.Verbose {
+                    fmt.Printf("[%sSOURCEMAP%s] %s: scanned %d original sources (url+.map)\n",
+                        colors["CYAN"], colors["NC"], urlStr, n2)
                 }
             }
         } else {
@@ -4562,6 +4599,19 @@ func reportMatchesWithConfig(source string, body []byte, config *Config) map[str
                             headerPrinted = true
                         }
                         fmt.Printf("Sensitive Data [%s%s%s]: %s\n", colors["YELLOW"], name, colors["NC"], match)
+                        // In-band JWT decoder: when a JWT-class pattern fires,
+                        // decode the token and print enrichment inline so the
+                        // operator sees the algorithm, expiry, subject and any
+                        // role/scope/permissions claims without a separate tool.
+                        rawMatch := match
+                        if idx := strings.Index(rawMatch, " [conf="); idx != -1 {
+                            rawMatch = rawMatch[:idx]
+                        }
+                        if (isJWTPatternName(name) || looksLikeJWTValue(rawMatch)) {
+                            if info := decodeJWT(rawMatch); info != nil {
+                                printJWTInfo(info, config)
+                            }
+                        }
                     }
                 }
             }
